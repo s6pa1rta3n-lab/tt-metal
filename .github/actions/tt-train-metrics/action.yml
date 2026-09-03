@@ -1,0 +1,123 @@
+name: "Upload tt-train metrics"
+description: >
+  Stage tt-train JSON metrics, upload loss plots, append the plot to the job
+  summary, and optionally SFTP the JSON. Shared by tt-train-tests (single-host)
+  and models-e2e-tests-multihost (NFS $PIPELINE_DIR).
+
+inputs:
+  metrics-dir:
+    description: >
+      Directory containing *.json and plots/*losses.{png,md}. Single-host
+      jobs use $workspace/generated/tt-train-metrics; multihost jobs use the
+      NFS scratch dir because the mpirun rank writes outside this container.
+    required: true
+  workspace:
+    description: >
+      Tree the SFTP batchfile is relative to. JSON is staged to
+      $workspace/generated/tt-train-metrics when metrics-dir is elsewhere.
+    required: true
+  loss-plot-artifact-name:
+    description: Artifact name for the PNG (must be unique across matrix legs)
+    required: true
+  ssh-private-key:
+    description: Private key for the tt-train metrics SFTP bucket
+    required: true
+  username:
+    description: SFTP username
+    required: true
+  hostname:
+    description: SFTP hostname
+    required: true
+  upload-sftp:
+    description: Upload JSON metrics via SFTP (false for non-perf / non-train legs)
+    required: false
+    default: "true"
+  upload-metrics-artifact:
+    description: Also upload metrics-dir as a UUID-prefixed GitHub artifact
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    # Detect JSON and copy it to $workspace/generated/tt-train-metrics when the
+    # writer put it somewhere else (multihost NFS). hashFiles cannot see NFS.
+    - name: Stage tt-train metrics for upload
+      id: stage
+      if: always()
+      shell: bash
+      env:
+        METRICS_DIR: ${{ inputs.metrics-dir }}
+        WORKSPACE: ${{ inputs.workspace }}
+      run: |
+        set -euo pipefail
+        has_json=false
+        dest="$WORKSPACE/generated/tt-train-metrics"
+
+        if [ -d "$METRICS_DIR" ] && compgen -G "$METRICS_DIR/*.json" > /dev/null; then
+          has_json=true
+          mkdir -p "$dest"
+          src=$(cd "$METRICS_DIR" && pwd)
+          dst=$(cd "$dest" && pwd)
+          if [ "$src" != "$dst" ]; then
+            echo "Staging metrics JSON from $src to $dst"
+            cp -f "$METRICS_DIR"/*.json "$dest/"
+          fi
+        else
+          echo "No tt-train metrics JSON under $METRICS_DIR"
+        fi
+
+        echo "has_json=$has_json" >> "$GITHUB_OUTPUT"
+
+    # archive: false gives a direct PNG link. run_models.py prefixes each
+    # filename with the model + card so matrix legs cannot collide.
+    - name: Upload loss plot
+      id: upload-loss-plot
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: ${{ inputs.loss-plot-artifact-name }}
+        path: ${{ inputs.metrics-dir }}/plots/*losses.png
+        if-no-files-found: warn
+        retention-days: 30
+        archive: false
+
+    - name: Add loss plot to summary
+      if: ${{ !cancelled() && steps.upload-loss-plot.outputs.artifact-url != '' }}
+      shell: bash
+      env:
+        METRICS_DIR: ${{ inputs.metrics-dir }}
+        ARTIFACT_URL: ${{ steps.upload-loss-plot.outputs.artifact-url }}
+      run: |
+        {
+          shopt -s nullglob
+          md_files=("$METRICS_DIR"/plots/*losses.md)
+          if [ ${#md_files[@]} -gt 0 ]; then
+            cat "${md_files[@]}"
+          fi
+          echo "[Download full loss plot image]($ARTIFACT_URL)"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # Paths in the batchfile are relative to workspace, not $GITHUB_WORKSPACE.
+    - name: Upload tt-train metrics data to AWS SFTP bucket
+      timeout-minutes: 5
+      if: >-
+        ${{ !cancelled() && inputs.upload-sftp == 'true'
+        && steps.stage.outputs.has_json == 'true' }}
+      uses: tenstorrent/tt-metal/.github/actions/upload-data-via-sftp@main
+      with:
+        ssh-private-key: ${{ inputs.ssh-private-key }}
+        sftp-batchfile: .github/actions/upload-data-via-sftp/tt_train_model_metrics.txt
+        username: ${{ inputs.username }}
+        hostname: ${{ inputs.hostname }}
+        path: ${{ inputs.workspace }}
+
+    - name: Upload tt-train metrics artifact
+      timeout-minutes: 10
+      if: >-
+        ${{ always() && inputs.upload-metrics-artifact == 'true'
+        && steps.stage.outputs.has_json == 'true' }}
+      uses: tenstorrent/tt-metal/.github/actions/upload-artifact-with-job-uuid@main
+      with:
+        path: ${{ inputs.metrics-dir }}
+        prefix: "metrics_"

@@ -10,6 +10,7 @@ METALIUM_GUIDE.md @davorchap @tenstorrent/metalium-developers-infra
 .github/ @tenstorrent/metalium-developers-infra
 .github/TESTOWNERS @tenstorrent/metalium-developers-infra
 .github/actions/sweep-run-analysis/ @stevendae @tenstorrent/metalium-developers-infra
+.github/actions/tt-train-metrics/ @ayerofieiev-tt @philei-tt @jmalone-tt @kevinwuTT @tenstorrent/metalium-developers-infra
 .github/bug_checker/ @stevendae @cmaryanTT
 .github/copilot-instructions.md @tenstorrent/metalium-developers-infra
 .github/deprecations.json
