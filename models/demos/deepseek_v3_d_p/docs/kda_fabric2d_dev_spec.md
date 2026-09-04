@@ -25,7 +25,7 @@ Out of scope: C++/firmware changes, CCL-manager consolidation, Fabric1D comparis
 
 - **Existing:** `tt/kda/config.py` defines the immutable program configurations and Kimi-K3 factory.
 - **Existing:** `tt/kda/kda.py` owns SP/TP axes, CCL resources, and output reduce-scatter.
-- **Existing:** `tt/kda/convolution.py` and `tt/kda/recurrence.py` launch SP-axis all-gathers without an explicit topology.
+- **Existing:** `tt/kda/convolution.py` and `tt/kda/recurrence.py` launch synchronous SP-axis all-gathers without an explicit topology. TTNN deprecates topology on that interface, so the implementation must use the supported async collective when making topology explicit.
 - **Existing:** `tests/kda/utils.py` constructs production-dimension KDA layers and inputs.
 - **Existing:** `tests/kda/layer/test_acceptance.py` covers independent-reference accuracy and bitwise repeatability.
 - **Existing:** `tests/kda/components/test_recurrence.py` asserts deterministic output and stable program-cache count.
@@ -53,7 +53,7 @@ Modify `tt/kda/kda.py`:
 - after validating/storing axes, freeze `self.sp_ccl_topology = topology[sp_axis]` and `self.tp_ccl_topology = topology[tp_axis]`;
 - in `_project_output`, use `self.tensor_parallel_axis` for all semaphore/link lookups and `cluster_axis` regardless of SP size;
 - pass `self.tp_ccl_topology` to TP reduce-scatter;
-- pass `self.sp_ccl_topology` into the convolution-carry and recurrence-summary helpers;
+- require a CCL manager whenever either mesh axis is distributed, and pass it with `self.sp_ccl_topology` into the convolution-carry and recurrence-summary helpers;
 - retain the TP-size-one branch and current output memory/layout behavior.
 
 Do not alter C++ collectives. If a retained failure appears below this boundary, stop and raise a design conflict with its standalone reproducer.
@@ -62,8 +62,8 @@ Do not alter C++ collectives. If a retained failure appears below this boundary,
 
 Modify `tt/kda/convolution.py` and `tt/kda/recurrence.py`:
 
-- add a required scalar `topology: ttnn.Topology` argument to the SP exchange/composition boundary;
-- supply that topology to each `ttnn.all_gather` alongside the existing explicit `sequence_parallel_axis`;
+- add required scalar `topology: ttnn.Topology` and `tt_ccl: TT_CCL` arguments to the SP exchange/composition boundary;
+- replace synchronous `ttnn.all_gather` with `ttnn.experimental.all_gather_async`, supplying the manager's all-gather semaphore, barrier semaphore, link count, the existing explicit `sequence_parallel_axis`, and the selected topology;
 - do not accept a two-axis tuple at these leaf helpers: each launches CCLs on exactly one already-selected axis.
 
 ### Construction and contract tests
@@ -101,7 +101,7 @@ Recalibrate `tests/kda/perf/test_layer_perf.py` on the designated LoudBox using 
 1. Test/application chooses fabric, derives `(dim0 topology, dim1 topology)` with `per_axis_topology()`, and opens the matching mesh.
 2. Caller constructs `ttKDA` with that tuple, SP/TP axes, and a CCL manager.
 3. Constructor validates the tuple and freezes its SP- and TP-selected scalar values.
-4. Forward computes local KDA output; SP carry exchanges launch all-gather with the selected SP topology and explicit SP axis.
+4. Forward computes local KDA output; SP carry exchanges launch async all-gather with the selected SP topology, explicit SP axis, and resources from the existing CCL manager.
 5. If TP size > 1, output projection obtains semaphore handles and link count for the TP axis and launches reduce-scatter with the selected TP topology and same explicit axis.
 6. The result remains sequence-sharded over SP and hidden-width-sharded over TP.
 
@@ -109,7 +109,7 @@ Failure paths:
 
 - invalid/equal axes fail at construction as today;
 - scalar, malformed, or non-`ttnn.Topology` tuple values fail at construction;
-- missing CCL with TP > 1 fails at construction as today;
+- missing CCL with TP > 1 or SP > 1 fails at construction;
 - unknown torus/ring fabric mapping warns and chooses Linear at the caller's shared-helper boundary;
 - a mismatch between the passed tuple and opened fabric cannot be detected cheaply by KDA; integration tests must derive both from the same profile value.
 

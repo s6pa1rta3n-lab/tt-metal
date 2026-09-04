@@ -27,6 +27,7 @@ Non-goals: change CCL kernels, diagnose an unretained historical runtime failure
 - **Observed:** MLA accepts a scalar only as backward-compatible shorthand which applies the same topology to both axes; direct cache and sparse tests exercise it by omitting the argument and falling through the `Linear` default (`tt/mla/mla.py:276-286`, `tests/cache/test_mla_cache.py:174-183`, `tests/sparse_mla/test_sparse_mla.py:405-417`).
 - **Observed:** `per_axis_topology()` already owns the DeepSeek fabric-to-axis mapping and queries the active fabric when no value is supplied (`tt/tt_ccl.py:372-413`).
 - **Observed:** KDA has SP-axis all-gathers in convolution carry exchange and recurrence-summary composition, and neither currently supplies topology (`tt/kda/convolution.py:43-48`, `tt/kda/recurrence.py:242-247`).
+- **Observed:** the synchronous `ttnn.all_gather` topology/axis interface is deprecated; the supported explicit-topology interface is `ttnn.experimental.all_gather_async`, which consumes the semaphore, barrier, link-count, axis, and topology resources already owned by KDA's CCL manager (`ttnn/cpp/ttnn/operations/ccl/all_gather/all_gather.cpp`, `models/tt_transformers/tt/ccl.py`).
 - **Observed:** multi-device KDA component, distributed, acceptance, and performance tests previously selected Fabric1D; TorusXY was already a distinct 8x4 case.
 
 ## Proposed design
@@ -46,7 +47,7 @@ configured fabric -> per_axis_topology() -> (dim0 topology, dim1 topology)
        SP carry all-gathers       TP output reduce-scatter
 ```
 
-Remove topology from `KDAProgramConfig`; program config remains limited to compute/program tuning. Passing the tuple as a construction dependency keeps fabric selection outside the layer and avoids an implicit query of mutable global fabric state. Keep the current CCL manager during this change: replacing `models.tt_transformers.tt.ccl.TT_CCL` with the DeepSeek manager is a separate ownership/consolidation decision and is not required to establish the contract.
+Remove topology from `KDAProgramConfig`; program config remains limited to compute/program tuning. Passing the tuple as a construction dependency keeps fabric selection outside the layer and avoids an implicit query of mutable global fabric state. Keep the current CCL manager during this change and use its resources for supported async SP all-gathers as well as the existing TP reduce-scatter. Replacing `models.tt_transformers.tt.ccl.TT_CCL` with the DeepSeek manager is a separate ownership/consolidation decision and is not required to establish the contract.
 
 Use plain Fabric2D for every KDA test that opens more than one device. Keep TorusXY cases separate because they assert a different physical contract. Single-device tests remain fabric-disabled.
 
@@ -66,12 +67,13 @@ Use plain Fabric2D for every KDA test that opens more than one device. Keep Toru
 ### SP collectives
 
 - Precondition: SP size greater than one invokes convolution-carry and recurrence-summary exchange on `sp_axis`.
-- Guarantee: each SP all-gather receives both explicit `cluster_axis=sp_axis` and scalar `topology=topology[sp_axis]`.
+- Precondition: any distributed SP exchange requires a CCL manager.
+- Guarantee: each SP exchange uses `ttnn.experimental.all_gather_async` with the manager's all-gather semaphore, barrier semaphore, link count, explicit `cluster_axis=sp_axis`, and scalar `topology=topology[sp_axis]`.
 - Invariant: TP size and topology do not change SP topology selection.
 
 ### TP reduce-scatter
 
-- Precondition: TP size greater than one requires a CCL manager.
+- Precondition: TP size greater than one requires a CCL manager; construction also requires one when SP size is greater than one.
 - Guarantee: semaphore pools, link count, and the operation all receive the same explicit `tp_axis`, while the operation receives scalar `topology=topology[tp_axis]`; output remains reduce-scattered on hidden width.
 - Invariant: SP size does not change TP topology or axis selection.
 
