@@ -71,3 +71,53 @@ The prototype therefore stays in DeepSeek KDA Python and KDA tests. It reuses th
 - No 8x4 TorusXY host was available; its existing test was skipped as infeasible on this 8-device host.
 - The historical failing environment and exact failure phase are unknown.
 - The one-off `--dev` teardown recovery failure was not pursued because it did not reproduce without instrumentation and is outside the KDA data path.
+
+## Appendix A: How MLA tests exercise Fabric2D
+
+This appendix surveys the direct `ttMLA` layer tests, its ring-joint SDPA tests, sparse-MLA tests, and the MLA cache-table integration test. It is a precedent for KDA test organization, not evidence about the historical KDA timeout.
+
+### Result
+
+**Observed:** MLA testing is Fabric2D-first, but it is not completely free of Fabric1D. The principal dense, chunked, ring-joint, cache, and sparse suites use plain Fabric2D or an axis-appropriate torus profile. One direct `ttMLA` integration case, `test_glm_kv_cache_table`, still selects `FABRIC_1D` (`tests/test_kv_cache_table.py:587-623`). Generic fixture compatibility tables also mention Fabric1D, but those tables describe allowed hardware combinations rather than selecting a profile for an MLA test (`tests/conftest.py:190-240`).
+
+### The reusable MLA pattern
+
+1. **Pair logical mesh and fabric profile in the same parameter.** Dense MLA uses unwrapped Fabric2D for 2x4 and 32x4 meshes and TorusXY for the certified 8x4 production mesh (`tests/test_mla.py:417-428`). Chunked MLA similarly pairs 2x2/2x4 with plain Fabric2D and 8x4 with TorusXY (`tests/test_mla.py:912-921`). This prevents a mesh case from accidentally inheriting a separate, incompatible topology parameter.
+2. **Derive topology from the selected fabric.** Dense and chunked tests call `per_axis_topology(device_params["fabric_config"])` and pass its tuple into `ttMLA` (`tests/test_mla.py:188-215`, `tests/test_mla.py:973-982`). Ring-joint tests select the tuple element for the actual ring-parallel axis (`tests/op_unit_tests/test_ring_joint_mla.py:505-552`, `tests/op_unit_tests/test_ring_joint_mla.py:872-923`). Tests do not independently parametrize `Topology.Ring` versus `Topology.Linear`.
+3. **Make physical wrapping explicit in the profile.** The shared mapping produces `(Linear, Linear)` for plain Fabric2D, `(Linear, Ring)` for TorusX, `(Ring, Linear)` for TorusY, and `(Ring, Ring)` for TorusXY (`tt/tt_ccl.py:372-413`). `ttMLA` stores separate SP and TP topology values and uses the TP value with its explicit TP axis for output reduce-scatter (`tt/mla/mla.py:452-466`, `tt/mla/mla.py:1263-1273`).
+4. **Gate cases by hardware geometry.** MLA cases use `requires_mesh_topology` where a particular physical mesh or ring is required. The 8x4 TorusXY performance case is additionally Blackhole/high-power gated (`tests/test_mla.py:987-1013`). A feasibility skip means the topology was not validated on that host.
+5. **Keep ordinary Fabric2D and torus coverage distinct.** Ring-joint correctness runs on plain Fabric2D across 32x4, 4x2, and 2x2, while its performance matrix separately adds TorusXY 8x4 (`tests/op_unit_tests/test_ring_joint_mla.py:505-552`, `tests/op_unit_tests/test_ring_joint_mla.py:872-894`). This tests line and wrapped paths without treating Ring/Linear as arbitrary tuning.
+
+### Hardware-adaptive sparse MLA
+
+Sparse MLA centralizes mesh/profile selection in `sparse_mla_mesh.py`:
+
+| Physical/logical shape | Selected profile | Required topology marker |
+| --- | --- | --- |
+| 1x1 | fabric disabled | none |
+| Nx1, N > 2 | TorusY | ring |
+| 1xN, N > 2 | TorusX | ring |
+| certified 8x4 | TorusXY | mesh-8x4 |
+| other multi-device shapes | plain Fabric2D | matching mesh shape |
+
+The helper chooses exact whole-box shape sets for 4-, 8-, and 32-device systems, avoiding unsupported submesh assumptions (`tests/sparse_mla/sparse_mla_mesh.py:20-56`, `tests/sparse_mla/sparse_mla_mesh.py:108-150`). This is stronger than merely replacing `FABRIC_1D` text: it makes physical wiring, logical axes, fabric firmware, and the expected topology one test-case contract.
+
+### Cache coverage nuance
+
+The standalone MLA weight-cache test opens plain Fabric2D on 2x2 and 2x4 (`tests/cache/test_mla_cache.py:41-61`) but constructs `ttMLA` without a topology argument. Its default scalar Linear topology is correct for plain Fabric2D, but the test does not demonstrate torus topology propagation. Tests that exercise torus explicitly derive and pass the per-axis tuple.
+
+### Remaining Fabric1D exception
+
+`test_glm_kv_cache_table` is a real exception, not a false-positive inventory match: it constructs and forwards a sparse `ttMLA` layer on an 8x4 mesh after explicitly opening Fabric1D, then derives topology from that profile (`tests/test_kv_cache_table.py:587-623`, `tests/test_kv_cache_table.py:643-702`). It should not be cited as Fabric2D precedent. Converting it belongs to MLA/cache-table cleanup, outside the KDA prototype.
+
+### Implication for KDA
+
+KDA should adopt the successful structural pattern rather than claim MLA is already perfectly migrated:
+
+- pair each multi-device mesh with `fabric2d_device_params()` or an explicit torus helper;
+- derive topology only from that selected fabric and the operation axis;
+- keep plain Fabric2D and TorusXY cases distinct;
+- use feasibility markers for wiring-dependent coverage;
+- retain no KDA Fabric1D exception, including kernel/component, layer, acceptance, and performance tests.
+
+Unlike sparse MLA, KDA currently has a fixed, small layout matrix, so a new hardware-adaptive routing abstraction is unnecessary. The existing shared profile helpers and explicit pytest parameters are sufficient.
