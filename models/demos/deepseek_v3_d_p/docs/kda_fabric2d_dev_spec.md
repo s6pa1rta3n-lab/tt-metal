@@ -153,3 +153,15 @@ Record exact command, commit, host, firmware/KMD, pass/fail/skip counts, PCC val
 - **Risk:** callers can pass a tuple inconsistent with the opened fabric. Keep fabric choice and tuple derivation adjacent at composition roots and cover them through profile-driven integration tests.
 - **Assumed:** configured fabric is stable for the lifetime of constructed layers.
 - **Required response:** if the historical timeout reappears, preserve complete logs and environment identity before changing C++ or recovery code.
+
+## Implementation validation
+
+The approved design was implemented in `da25439f8c3` and calibrated on `bh-lb-42-special-mvasilijevic-for-reservation-121898` with eight Blackhole p150b devices, firmware 19.5.0.0, KMD 2.4.1, and IOMMU enabled. Each calibration session was a separate safe-pytest process/device initialization. Values below are per-session medians in milliseconds; the reference is the median of those five medians.
+
+| Layout | Session medians (ms) | Reference (ms) | Delta from prototype reference |
+| --- | --- | ---: | ---: |
+| SP1xTP8 | 11.067, 11.057, 11.051, 11.059, 11.048 | 11.057 | -0.04% |
+| SP2xTP4 | 9.922, 9.921, 9.925, 9.920, 9.915 | 9.921 | +0.31% |
+| SP4xTP2 | 10.259, 10.261, 10.257, 10.255, 10.251 | 10.257 | +2.01% |
+
+The implementation is performance-neutral for SP1xTP8 and SP2xTP4 at this measurement resolution; SP4xTP2 is 2.01% slower than the single-session throwaway prototype and remains within the existing 3% gate. Against the earlier SP1xTP8 Ring request (9.672–9.703 ms), the supported plain-Fabric2D Linear path remains approximately 14% slower; this is a topology-policy cost, not an async-SP-gather regression, because SP1 performs no SP gather.
